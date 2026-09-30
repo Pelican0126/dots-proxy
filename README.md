@@ -2,6 +2,8 @@
 
 ![架構圖](assets/architecture.png)
 
+[![License: CC BY-NC 4.0](https://img.shields.io/badge/License-CC%20BY--NC%204.0-lightgrey.svg)](LICENSE)
+
 把 OpenAI 的 dot（雲端常駐代理）變成 Codex 裡的一個 picker 模型：選中 `gpt-dot` 後，請求走 dot 雲端通道執行，還能通過本機橋接環境直接操控你的電腦。其餘模型原樣透傳官方後端，互不影響。
 
 > ⚠ 本項目使用 OpenAI 未公開的內部接口（逆向自官方桌面端），僅供個人學習研究，可能隨官方調整失效；請自行評估帳號風險。
@@ -64,6 +66,10 @@ requires_openai_auth = true
 ## 面板
 
 `http://127.0.0.1:8788/` — 調用記錄（模型/effort/耗時/狀態）、服務啟停、一鍵切回官方直連（自動備份並恢復 config）。
+
+## License
+
+[CC BY-NC 4.0](LICENSE) — 可自由使用、修改、分享，**禁止商用**；使用需署名。
 
 ## 安全說明
 
