@@ -1,0 +1,33 @@
+{
+  "version": "0.1.0",
+  "name": "dots",
+  "description": "Delegate work to your OpenAI dot — cloud-hosted always-on agent powered by GPT-6 Astra.",
+  "author": {
+    "name": "local"
+  },
+  "license": "UNLICENSED",
+  "keywords": [
+    "dots",
+    "openai",
+    "agent",
+    "cloud",
+    "mcp"
+  ],
+  "mcpServers": "./.mcp.json",
+  "interface": {
+    "displayName": "Dots",
+    "shortDescription": "Delegate work to your OpenAI dot in the cloud",
+    "longDescription": "Routes prompts to the hosted Codex app-server backend: one-shot cloud threads (dot_ask), your persistent primary dot (dot_message), and account/quota status (dot_status).",
+    "developerName": "local",
+    "category": "Developer Tools",
+    "capabilities": [
+      "Read",
+      "Write"
+    ],
+    "defaultPrompt": [
+      "用 dot 幫我做這個任務",
+      "查看 dot 狀態"
+    ],
+    "brandColor": "#000000"
+  }
+}

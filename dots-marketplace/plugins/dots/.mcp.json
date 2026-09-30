@@ -1,0 +1,25 @@
+{
+  "mcpServers": {
+    "dots": {
+      "command": "cmd.exe",
+      "args": [
+        "/d",
+        "/c",
+        "scripts\\launch_dots_mcp.cmd"
+      ],
+      "cwd": ".",
+      "env_vars": [
+        "PATH",
+        "USERPROFILE",
+        "CODEX_HOME",
+        "CODEX_MCP_NODE_PATH",
+        "DOT_THREAD_ID",
+        "HTTP_PROXY",
+        "HTTPS_PROXY",
+        "ALL_PROXY",
+        "NO_PROXY"
+      ],
+      "tool_timeout_sec": 3600
+    }
+  }
+}

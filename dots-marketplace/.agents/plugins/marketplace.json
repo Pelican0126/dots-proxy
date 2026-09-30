@@ -1,0 +1,13 @@
+{
+  "name": "dots-marketplace",
+  "owner": {
+    "name": "local"
+  },
+  "plugins": [
+    {
+      "name": "dots",
+      "source": "./plugins/dots",
+      "description": "Delegate work to your OpenAI dot — cloud-hosted always-on agent powered by GPT-6 Astra."
+    }
+  ]
+}

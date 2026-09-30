@@ -1,0 +1,21 @@
+# secrets & local state
+.poc-token*
+.auth*
+*.log
+
+# runtime data
+dots-proxy-calls.jsonl
+dots-manager-state.json
+account-models.json
+
+# dev artifacts
+poc-*.mjs
+test-*.mjs
+schema-out/
+
+# os / editor
+.DS_Store
+Thumbs.db
+node_modules/
+.env
+.env.*
