@@ -16,10 +16,14 @@ const LOG_FILE = join(SCRIPT_DIR, 'dots-proxy-calls.jsonl');
 const CONFIG_PATH = join(process.env.USERPROFILE || '', '.codex', 'config.toml');
 const STATE_FILE = join(SCRIPT_DIR, 'dots-manager-state.json');
 
+const DOTS_CATALOG = (() => {
+  const local = join(SCRIPT_DIR, 'dots-model-catalog.local.json');
+  try { readFileSync(local); return local; } catch { return join(SCRIPT_DIR, 'dots-model-catalog.json'); }
+})();
 const DOTS_SCALARS = [
   '# dots: 本地代理入口（picker 裡的 gpt-dot 走 dot 雲端,其餘模型透傳官方後端）',
   'model_provider = "dots"',
-  'model_catalog_json = "' + join(SCRIPT_DIR, 'dots-model-catalog.json').replace(/\\/g, '/') + '"',
+  'model_catalog_json = "' + DOTS_CATALOG.replace(/\\/g, '/') + '"',
 ];
 const DOTS_PROVIDER_TABLE = [
   '[model_providers.dots]',
