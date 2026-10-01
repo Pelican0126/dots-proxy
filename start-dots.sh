@@ -4,14 +4,22 @@
 # with the ChatGPT desktop app (so a separate Node install is not required).
 DIR="$(cd "$(dirname "$0")" && pwd)"
 
+node_supported() {
+  v="$1"
+  major=$("$v" --version 2>/dev/null) || return 1
+  major=${major#v}
+  major=${major%%.*}
+  [ "$major" -ge 22 ] 2>/dev/null
+}
+
 pick_node() {
-  if command -v node >/dev/null 2>&1; then command -v node; return; fi
   for c in \
+    "$(command -v node 2>/dev/null || true)" \
     /opt/homebrew/bin/node \
     /usr/local/bin/node \
     "/Applications/ChatGPT.app/Contents/Resources/cua_node/bin/node" \
     "$CODEX_MCP_NODE_PATH"; do
-    [ -n "$c" ] && [ -x "$c" ] && { echo "$c"; return; }
+    [ -n "$c" ] && [ -x "$c" ] && node_supported "$c" && { echo "$c"; return; }
   done
   return 1
 }

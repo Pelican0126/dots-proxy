@@ -4,18 +4,19 @@
 // Zero deps. Node >= 22.
 import http from 'node:http';
 import https from 'node:https';
-import tls from 'node:tls';
 import crypto from 'node:crypto';
 import zlib from 'node:zlib';
-import { readFileSync, writeFileSync, appendFileSync } from 'node:fs';
+import { appendFileSync, existsSync, readFileSync, renameSync, statSync, unlinkSync, writeFileSync } from 'node:fs';
 import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { homedir } from 'node:os';
 import { execSync } from 'node:child_process';
+import { CodexWsClient as Ws } from './ws-client.mjs';
 
 const SCRIPT_DIR = dirname(fileURLToPath(import.meta.url));
 
 const PORT = Number(process.env.DOTS_PROXY_PORT || 8789);
+const MAX_BODY_BYTES = 20 * 1024 * 1024;
 const BIND = '127.0.0.1';
 const DOT_SLUG = process.env.DOTS_PROXY_MODEL || 'gpt-6-astra-dot';
 const UPSTREAM_HOST = 'codex-cloud-backend.chatgpt.com';
@@ -30,6 +31,21 @@ const CODEX_UA = process.env.DOTS_UA ||
   `codex/0.159.2 (${process.platform === 'darwin' ? 'Mac OS 26.0.0' : process.platform === 'win32' ? 'Windows 10.0' : 'Linux'}; ${process.arch === 'arm64' ? 'arm64' : 'x86_64'})`;
 
 function log(...a) { console.error('[dots-proxy]', ...a); }
+function writeAtomic(path, data) {
+  const tmp = `${path}.tmp-${process.pid}-${Date.now()}`;
+  try {
+    writeFileSync(tmp, data, { mode: 0o600 });
+    try { renameSync(tmp, path); }
+    catch (e) {
+      if (!['EEXIST', 'EPERM'].includes(e.code)) throw e;
+      const old = `${path}.old-${process.pid}-${Date.now()}`;
+      let moved = false;
+      try { renameSync(path, old); moved = true; renameSync(tmp, path); try { unlinkSync(old); } catch {} }
+      catch (replaceError) { if (moved) { try { renameSync(old, path); } catch {} } throw replaceError; }
+    }
+  }
+  finally { try { if (existsSync(tmp)) unlinkSync(tmp); } catch {} }
+}
 
 // ---------- auth / token refresh ----------
 function loadAuth() { return JSON.parse(readFileSync(AUTH_PATH, 'utf8')); }
@@ -47,6 +63,7 @@ async function ensureAuth() {
     const res = await fetch('https://auth.openai.com/oauth/token', {
       method: 'POST',
       headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+      signal: AbortSignal.timeout(30000),
       body: new URLSearchParams({ grant_type: 'refresh_token', client_id: CLIENT_ID, refresh_token: auth.tokens.refresh_token }),
     });
     if (!res.ok) throw new Error('token refresh failed: HTTP ' + res.status);
@@ -57,137 +74,45 @@ async function ensureAuth() {
     cur.tokens.id_token = data.id_token ?? cur.tokens.id_token;
     cur.tokens.refresh_token = data.refresh_token ?? cur.tokens.refresh_token;
     cur.last_refresh = new Date().toISOString();
-    writeFileSync(AUTH_PATH, JSON.stringify(cur, null, 2));
+    writeAtomic(AUTH_PATH, JSON.stringify(cur, null, 2));
     log('token refreshed');
     return cur;
   })().finally(() => { refreshing = null; });
   return refreshing;
 }
 
-// ---------- raw-TLS WS JSON-RPC client ----------
-class Ws {
-  constructor({ host, token, accountId }) {
-    Object.assign(this, { host, token, accountId });
-    this.buf = Buffer.alloc(0);
-    this.upgraded = false;
-    this.nextId = 1;
-    this.pending = new Map();
-    this.handlers = [];
-    this.closed = false;
-  }
-  connect(timeoutMs = 20000) {
-    return new Promise((resolve, reject) => {
-      const key = crypto.randomBytes(16).toString('base64');
-      this.sock = tls.connect(443, this.host, { servername: this.host }, () => {
-        this.sock.write(
-          `GET / HTTP/1.1\r\nHost: ${this.host}\r\n` +
-          `Authorization: Bearer ${this.token}\r\n` +
-          `chatgpt-account-id: ${this.accountId}\r\n` +
-          `User-Agent: ${CODEX_UA}\r\n` +
-          `originator: codex_cli_rs\r\n` +
-          `Connection: Upgrade\r\nUpgrade: websocket\r\n` +
-          `Sec-WebSocket-Version: 13\r\nSec-WebSocket-Key: ${key}\r\n\r\n`);
-      });
-      const timer = setTimeout(() => reject(new Error('handshake timeout')), timeoutMs);
-      this.sock.on('data', (c) => {
-        this.buf = Buffer.concat([this.buf, c]);
-        if (!this.upgraded) {
-          const idx = this.buf.indexOf('\r\n\r\n');
-          if (idx === -1) return;
-          const head = this.buf.slice(0, idx).toString();
-          if (!head.includes(' 101')) { clearTimeout(timer); reject(new Error('handshake failed: ' + head.split('\r\n')[0])); return; }
-          this.upgraded = true;
-          this.buf = this.buf.slice(idx + 4);
-          clearTimeout(timer);
-          resolve();
-        }
-        this.#drain();
-      });
-      this.sock.on('error', (e) => { clearTimeout(timer); this.closed = true; reject(e); });
-      this.sock.on('close', () => {
-        this.closed = true;
-        for (const { reject: rej } of this.pending.values()) rej(new Error('socket closed'));
-        this.pending.clear();
-        this.#emit({ method: '__closed__' });
-      });
-    });
-  }
-  onNotification(fn) { this.handlers.push(fn); }
-  #emit(m) { for (const fn of this.handlers) { try { fn(m); } catch {} } }
-  #frame(opcode, payload) {
-    const mask = crypto.randomBytes(4);
-    let h;
-    const len = payload.length;
-    if (len < 126) h = Buffer.from([0x80 | opcode, 0x80 | len]);
-    else if (len < 65536) { h = Buffer.alloc(4); h[0] = 0x80 | opcode; h[1] = 0x80 | 126; h.writeUInt16BE(len, 2); }
-    else { h = Buffer.alloc(10); h[0] = 0x80 | opcode; h[1] = 0x80 | 127; h.writeBigUInt64BE(BigInt(len), 2); }
-    const m = Buffer.from(payload);
-    for (let i = 0; i < m.length; i++) m[i] ^= mask[i & 3];
-    this.sock.write(Buffer.concat([h, mask, m]));
-  }
-  call(method, params = {}) {
-    const id = this.nextId++;
-    this.#frame(0x1, Buffer.from(JSON.stringify({ id, method, params }), 'utf8'));
-    return new Promise((resolve, reject) => this.pending.set(id, { resolve, reject }));
-  }
-  #drain() {
-    while (true) {
-      if (this.buf.length < 2) break;
-      const opcode = this.buf[0] & 0x0f;
-      let len = this.buf[1] & 0x7f;
-      let off = 2;
-      if (len === 126) { if (this.buf.length < 4) break; len = this.buf.readUInt16BE(2); off = 4; }
-      else if (len === 127) { if (this.buf.length < 10) break; len = Number(this.buf.readBigUInt64BE(2)); off = 10; }
-      if (this.buf.length < off + len) break;
-      const payload = this.buf.slice(off, off + len);
-      this.buf = this.buf.slice(off + len);
-      if (opcode === 0x9) { this.#frame(0xa, payload); continue; }
-      if (opcode === 0x8) { this.closed = true; this.#emit({ method: '__closed__' }); continue; }
-      if (opcode !== 0x1 && opcode !== 0x0) continue;
-      let msg;
-      try { msg = JSON.parse(payload.toString('utf8')); } catch { continue; }
-      if (msg.id !== undefined && this.pending.has(msg.id)) {
-        const { resolve, reject } = this.pending.get(msg.id);
-        this.pending.delete(msg.id);
-        msg.error ? reject(new Error(JSON.stringify(msg.error))) : resolve(msg.result);
-      } else this.#emit(msg);
-    }
-  }
-  close() { try { this.#frame(0x8, Buffer.alloc(0)); } catch {} try { this.sock.destroy(); } catch {} }
-}
-
 // ---------- shared upstream session ----------
 let ws = null;
+let connecting = null;
 const threadWaiters = new Map();
 async function upstream() {
   if (ws && !ws.closed) return ws;
-  const auth = await ensureAuth();
-  const client = new Ws({ host: UPSTREAM_HOST, token: auth.tokens.access_token, accountId: auth.tokens.account_id });
-  client.onNotification((m) => {
-    const tid = m.params?.threadId;
-    if (tid && threadWaiters.has(tid)) for (const fn of threadWaiters.get(tid)) fn(m);
-  });
-  await client.connect();
-  await client.call('initialize', { clientInfo: { name: 'dots-proxy', version: '0.2.0' } });
-  ws = client;
-  log('upstream connected');
-  return ws;
+  if (connecting) return connecting;
+  connecting = (async () => {
+    const auth = await ensureAuth();
+    const client = new Ws({ host: UPSTREAM_HOST, token: auth.tokens.access_token, accountId: auth.tokens.account_id });
+    client.onNotification((m) => {
+      const tid = m.params?.threadId;
+      if (tid && threadWaiters.has(tid)) for (const fn of threadWaiters.get(tid)) fn(m);
+    });
+    await client.connect();
+    await client.call('initialize', { clientInfo: { name: 'dots-proxy', version: '0.2.0' } });
+    ws = client;
+    log('upstream connected');
+    return ws;
+  })().finally(() => { connecting = null; });
+  return connecting;
 }
-function waitTurnDone(threadId, timeoutMs) {
+function waitTurnDone(threadId, timeoutMs, signal) {
   return new Promise((resolve, reject) => {
-    const timer = setTimeout(() => { cleanup(); reject(new Error('turn timeout')); }, timeoutMs);
-    const fn = (m) => {
-      if (m.method === 'turn/completed' && m.params?.threadId === threadId) {
-        cleanup();
-        const turn = m.params.turn || {};
-        turn.status === 'completed' ? resolve(turn) : reject(new Error('turn ' + turn.status + (turn.error ? ': ' + JSON.stringify(turn.error) : '')));
-      }
-    };
-    const cleanup = () => {
-      clearTimeout(timer);
-      const set = threadWaiters.get(threadId);
-      if (set) { set.delete(fn); if (!set.size) threadWaiters.delete(threadId); }
-    };
+    let settled = false;
+    const cleanup = () => { clearTimeout(timer); signal?.removeEventListener('abort', onAbort); const set = threadWaiters.get(threadId); if (set) { set.delete(fn); if (!set.size) threadWaiters.delete(threadId); } };
+    const finish = (err, value) => { if (settled) return; settled = true; cleanup(); err ? reject(err) : resolve(value); };
+    const onAbort = () => finish(new Error('request aborted'));
+    const timer = setTimeout(() => finish(new Error('turn timeout')), timeoutMs);
+    const fn = (m) => { if (m.method === 'turn/completed' && m.params?.threadId === threadId) { const turn = m.params.turn || {}; turn.status === 'completed' ? finish(null, turn) : finish(new Error('turn ' + turn.status + (turn.error ? ': ' + JSON.stringify(turn.error) : ''))); } };
+    if (signal?.aborted) return onAbort();
+    signal?.addEventListener('abort', onAbort, { once: true });
     if (!threadWaiters.has(threadId)) threadWaiters.set(threadId, new Set());
     threadWaiters.get(threadId).add(fn);
   });
@@ -222,20 +147,42 @@ function logEnd(rec, patch) {
   persist({ ...rec, _update: true });
 }
 function persist(rec) {
-  try { appendFileSync(LOG_FILE, JSON.stringify(rec) + '\n'); } catch {}
+  try {
+    try { if (statSync(LOG_FILE).size > 8 * 1024 * 1024) renameSync(LOG_FILE, LOG_FILE + '.1'); } catch {}
+    appendFileSync(LOG_FILE, JSON.stringify(rec) + '\n');
+  } catch {}
+}
+
+function validateDotBody(body) {
+  if (typeof body.instructions !== 'undefined' && typeof body.instructions !== 'string') return 'instructions must be a string';
+  if (typeof body.input === 'undefined') return 'input is required';
+  if (typeof body.input !== 'string' && !Array.isArray(body.input)) return 'input must be a string or array';
+  if (Array.isArray(body.input)) for (const item of body.input) {
+    if (!item) return 'input item must be an object';
+    if (item.type === 'input_text') {
+      if (typeof item.text !== 'string') return 'input_text.text must be a string';
+      continue;
+    }
+    if (item.type !== 'message') return 'unsupported input item; only message and input_text items are supported';
+    if (typeof item.content !== 'string' && !Array.isArray(item.content)) return 'message content must be a string or array';
+    if (Array.isArray(item.content) && item.content.some((part) => typeof part === 'string' ? false : !part || typeof part.text !== 'string')) return 'only text content is supported';
+  }
+  return null;
 }
 
 // ---------- dot turn ----------
-function flattenInput(input) {
-  if (typeof input === 'string') return input;
-  if (!Array.isArray(input)) return '';
+function flattenInput(input, instructions = '') {
   const lines = [];
+  if (typeof instructions === 'string' && instructions.trim()) lines.push('Instructions: ' + instructions.trim());
+  if (typeof input === 'string') { lines.push('User: ' + input); return lines.join('\n\n'); }
+  if (!Array.isArray(input)) return lines.join('\n\n');
   for (const item of input) {
-    if (!item || item.type !== 'message') continue;
-    const role = item.role === 'user' ? 'User' : item.role === 'assistant' ? 'Assistant' : item.role;
-    const parts = Array.isArray(item.content) ? item.content : [];
-    const text = parts.map((p) => p?.text).filter(Boolean).join('\n');
-    if (text) lines.push(role + ': ' + text);
+    if (!item) continue;
+    if (item.type === 'message') {
+      const role = item.role === 'user' ? 'User' : item.role === 'assistant' ? 'Assistant' : item.role;
+      const content = typeof item.content === 'string' ? item.content : Array.isArray(item.content) ? item.content.map((p) => typeof p === 'string' ? p : p?.text).filter(Boolean).join('\n') : '';
+      if (content) lines.push(role + ': ' + content);
+    } else if (item.type === 'input_text' && item.text) lines.push('User: ' + item.text);
   }
   return lines.join('\n\n');
 }
@@ -247,11 +194,18 @@ const DEFAULT_WORKSPACE = process.env.DOTS_WORKSPACE || process.cwd();
 // environment-id of the codex exec-server bridge process the desktop app runs.
 function discoverEnvId() {
   if (process.platform === 'win32') {
-    try {
-      const out = execSync('wmic process where "name like \'codex%\'" get CommandLine /format:list', { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] });
-      const m = out.match(/exec-server\s+.*?--environment-id\s+(\S+)/i);
-      return m ? m[1] : '';
-    } catch { return ''; }
+    const commands = [
+      'wmic process where "name like \'codex%\'" get CommandLine /format:list',
+      'powershell -NoProfile -NonInteractive -Command "Get-CimInstance Win32_Process | Select-Object -ExpandProperty CommandLine"',
+    ];
+    for (const command of commands) {
+      try {
+        const out = execSync(command, { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] });
+        const m = out.match(/exec-server\s+.*?--environment-id(?:=|\s+)(\S+)/i);
+        if (m) return m[1].replace(/^['"]|['"]$/g, '');
+      } catch {}
+    }
+    return '';
   }
   try {
     const out = execSync('ps axo command', { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] });
@@ -263,38 +217,40 @@ function discoverEnvId() {
   } catch {}
   return '';
 }
-const LOCAL_ENV = (() => {
-  const v = process.env.DOTS_ENV_ID || '';
-  if (v && v !== 'auto') return v;
-  if (v === 'auto') {
-    const id = discoverEnvId();
-    if (id) { log('auto-discovered bridge environment:', id); return id; }
-    log('DOTS_ENV_ID=auto but no exec-server bridge found; running cloud-only');
-  }
-  return '';
-})();
+const ENV_SETTING = process.env.DOTS_ENV_ID || '';
+let lastAutoEnv = null;
+function resolveLocalEnv() {
+  if (ENV_SETTING && ENV_SETTING !== 'auto') return ENV_SETTING;
+  if (ENV_SETTING !== 'auto') return '';
+  const id = discoverEnvId();
+  if (id !== lastAutoEnv) log(id ? 'auto-discovered bridge environment: ' + id : 'DOTS_ENV_ID=auto but no exec-server bridge found; running cloud-only');
+  lastAutoEnv = id;
+  return id;
+}
 
 function extractCwd(body, flatText) {
   const text = (typeof body.instructions === 'string' ? body.instructions : '') + '\n' + flatText;
+  const clean = (value) => value.trim().replace(/\s+(?:then|and)\b.*$/i, '').replace(/[.,;]+$/, '').replace(/\\/g, '/').replace(/\/+$/, '');
   // <cwd>/path</cwd> (newer codex environment_context blocks)
   let m = text.match(/<cwd>\s*([^\s<][^<]*?)\s*<\/cwd>/i);
-  if (m) return m[1].trim().replace(/\\/g, '/').replace(/\/+$/, '');
+  if (m) return clean(m[1]);
   // Windows drive path: C:\... or C:/...
   m = text.match(/working directory[:\s]+([A-Za-z]:[\/\\][^\n`"<>|]*)/i);
-  if (m) return m[1].trim().replace(/\\/g, '/').replace(/\/+$/, '');
+  if (m) return clean(m[1]);
   // POSIX absolute path: /Users/... etc. Stop at whitespace/backtick/quote.
   m = text.match(/working directory[:\s]+(\/[^\n`"<>|]*)/i);
-  if (m) return m[1].trim().replace(/\/+$/, '');
+  if (m) return clean(m[1]);
   return null;
 }
 
-async function runDotTurn(promptText, cwd, effort, timeoutMs = 280000) {
+async function runDotTurn(promptText, cwd, effort, timeoutMs = 280000, signal) {
   const w = await upstream();
   const dir = cwd || DEFAULT_WORKSPACE;
   // env bridge can be briefly unreachable (app restart, reconnect) — retry thread/start
   let t, lastErr;
   const startParams = { model: 'gpt-6-astra', cwd: dir, approvalPolicy: 'never', sandbox: 'danger-full-access' };
-  if (LOCAL_ENV) startParams.environments = [{ environmentId: LOCAL_ENV, cwd: dir }];
+  const localEnv = resolveLocalEnv();
+  if (localEnv) startParams.environments = [{ environmentId: localEnv, cwd: dir }];
   for (let i = 0; i < 4; i++) {
     try {
       t = await w.call('thread/start', startParams);
@@ -308,20 +264,32 @@ async function runDotTurn(promptText, cwd, effort, timeoutMs = 280000) {
   }
   if (!t) throw lastErr;
   const tid = t.thread.id;
-  const done = waitTurnDone(tid, timeoutMs);
+  const turnController = new AbortController();
+  const relayAbort = () => turnController.abort();
+  signal?.addEventListener('abort', relayAbort, { once: true });
+  const done = waitTurnDone(tid, timeoutMs, turnController.signal);
+  done.catch(() => {});
   const turnParams = { threadId: tid, input: [{ type: 'text', text: promptText }] };
   if (effort) turnParams.effort = effort;
-  await w.call('turn/start', turnParams);
-  await done;
-  const items = await w.call('thread/items/list', { threadId: tid, limit: 100 });
-  const texts = [];
-  for (const it of (items.data || items.items || [])) {
-    const i2 = it.item || it;
-    if (i2.type === 'agentMessage' && i2.text) texts.push(i2.text);
-    else if (i2.type === 'mcpToolCall' && i2.tool === 'user_message.send_message' && i2.arguments?.text) texts.push(i2.arguments.text);
+  try {
+    await w.call('turn/start', turnParams);
+    await done;
+    const items = await w.call('thread/items/list', { threadId: tid, limit: 100 });
+    const texts = [];
+    for (const it of (items.data || items.items || [])) {
+      const i2 = it.item || it;
+      if (i2.type === 'agentMessage' && i2.text) texts.push(i2.text);
+      else if (i2.type === 'mcpToolCall' && i2.tool === 'user_message.send_message' && i2.arguments?.text) texts.push(i2.arguments.text);
+    }
+    return { text: texts.join('\n\n') || '(dot completed without a text reply)', tid };
+  } catch (e) {
+    turnController.abort();
+    w.call('turn/interrupt', { threadId: tid }).catch(() => {});
+    throw e;
+  } finally {
+    signal?.removeEventListener('abort', relayAbort);
+    w.call('thread/archive', { threadId: tid }).catch(() => {});
   }
-  w.call('thread/archive', { threadId: tid }).catch(() => {});
-  return { text: texts.join('\n\n') || '(dot completed without a text reply)', tid };
 }
 
 // ---------- Responses API emission ----------
@@ -334,16 +302,21 @@ function responseObject(id, model, text, status = 'completed') {
   return {
     id, object: 'response', created_at: Math.floor(Date.now() / 1000),
     status, model, output: [msg],
-    usage: { input_tokens: 0, output_tokens: 0, total_tokens: 0 },
   };
 }
 function sseWrite(res, event, data) {
   res.write(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`);
 }
+function sendDotError(res, status, message, body = {}) {
+  const id = 'resp_' + crypto.randomBytes(12).toString('hex');
+  const payload = { error: { message, type: 'server_error' }, id, object: 'response', status: 'failed', model: body.model || DOT_SLUG };
+  if (body.stream === false) { if (!res.headersSent) res.writeHead(status, { 'Content-Type': 'application/json' }); res.end(JSON.stringify(payload)); return; }
+  if (!res.headersSent) res.writeHead(status, { 'Content-Type': 'application/json' }); res.end(JSON.stringify(payload));
+}
 function sendDotResponse(req, res, body, text) {
   const id = 'resp_' + crypto.randomBytes(12).toString('hex');
   const model = body.model || DOT_SLUG;
-  if (body.stream === false) {
+  if (body.stream !== true) {
     res.writeHead(200, { 'Content-Type': 'application/json' });
     res.end(JSON.stringify(responseObject(id, model, text)));
     return;
@@ -377,6 +350,7 @@ function passthrough(req, res, rawBody, rec) {
   delete headers.host;
   delete headers['content-length'];
   delete headers['accept-encoding'];
+  delete headers['content-encoding'];
   headers['accept-encoding'] = 'identity';
   const up = https.request({
     host: PASSTHROUGH.host,
@@ -392,6 +366,8 @@ function passthrough(req, res, rawBody, rec) {
     res.writeHead(upRes.statusCode || 502, h);
     upRes.pipe(res);
   });
+  up.setTimeout(300000, () => up.destroy(new Error('passthrough timeout')));
+  res.once('close', () => { if (!res.writableEnded) up.destroy(new Error('client disconnected')); });
   up.on('error', (e) => {
     log('passthrough error:', e.message);
     if (rec) logEnd(rec, { status: 'error', error: e.message });
@@ -436,7 +412,7 @@ const CONSOLE_HTML = `<!doctype html>
 </head>
 <body>
 <h1>dots-proxy 調用記錄</h1>
-<div class="sub">每 2 秒自動刷新 · 只存本機 · 最多保留 500 條</div>
+<div class="sub">每 2 秒自動刷新 · 調用記錄保存在本機 · 最多顯示 500 條</div>
 <div class="stats" id="stats"></div>
 <div id="list"></div>
 <script>
@@ -487,17 +463,7 @@ document.getElementById('list').addEventListener('click',function(e){
 const server = http.createServer((req, res) => {
   if (req.method === 'GET' && (req.url === '/health' || req.url === '/v1/health')) {
     res.writeHead(200, { 'Content-Type': 'application/json' });
-    res.end(JSON.stringify({ ok: true, dotSlug: DOT_SLUG }));
-    return;
-  }
-  if (req.method === 'GET' && (req.url === '/' || req.url === '/console')) {
-    res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
-    res.end(CONSOLE_HTML);
-    return;
-  }
-  if (req.method === 'GET' && req.url === '/api/logs') {
-    res.writeHead(200, { 'Content-Type': 'application/json' });
-    res.end(JSON.stringify({ logs: [...callLogs].reverse() }));
+    res.end(JSON.stringify({ ok: true, dotSlug: DOT_SLUG, upstreamConnected: Boolean(ws && !ws.closed) }));
     return;
   }
   if (req.method !== 'POST' || !req.url.replace(/\?.*$/, '').endsWith('/responses')) {
@@ -506,16 +472,31 @@ const server = http.createServer((req, res) => {
     return;
   }
   const chunks = [];
-  req.on('data', (c) => chunks.push(c));
+  const abortController = new AbortController();
+  req.on('aborted', () => abortController.abort());
+  res.on('close', () => { if (!res.writableEnded) abortController.abort(); });
+  let bodyBytes = 0;
+  let bodyTooLarge = false;
+  req.on('data', (c) => {
+    bodyBytes += c.length;
+    if (bodyBytes > MAX_BODY_BYTES) { bodyTooLarge = true; return; }
+    chunks.push(c);
+  });
   req.on('end', async () => {
+    if (bodyTooLarge) { if (!res.headersSent) res.writeHead(413, { 'Content-Type': 'application/json' }); res.end(JSON.stringify({ error: { message: 'request body too large' } })); return; }
     let raw = Buffer.concat(chunks);
     const enc = req.headers['content-encoding'];
     try {
-      if (enc === 'zstd') raw = zlib.zstdDecompressSync(raw);
-      else if (enc === 'gzip') raw = zlib.gunzipSync(raw);
+      if (enc === 'zstd') raw = zlib.zstdDecompressSync(raw, { maxOutputLength: MAX_BODY_BYTES });
+      else if (enc === 'gzip') raw = zlib.gunzipSync(raw, { maxOutputLength: MAX_BODY_BYTES });
     } catch (e) {
       res.writeHead(400, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify({ error: { message: 'bad content-encoding: ' + e.message } }));
+      return;
+    }
+    if (raw.length > MAX_BODY_BYTES) {
+      res.writeHead(413, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: { message: 'request body too large after decompression' } }));
       return;
     }
     let body;
@@ -523,19 +504,24 @@ const server = http.createServer((req, res) => {
       passthrough(req, res, raw, logStart({ type: 'passthrough', model: null, status: 'running' }));
       return;
     }
+    if (!body || typeof body !== 'object' || Array.isArray(body)) {
+      res.writeHead(400, { 'Content-Type': 'application/json' }); res.end(JSON.stringify({ error: { message: 'request body must be a JSON object' } })); return;
+    }
     if (body.model !== DOT_SLUG) {
       passthrough(req, res, raw, logStart({ type: 'passthrough', model: body.model || null, status: 'running', effort: body.reasoning?.effort || null }));
       return;
     }
+    const schemaError = validateDotBody(body);
+    if (schemaError) { res.writeHead(400, { 'Content-Type': 'application/json' }); res.end(JSON.stringify({ error: { message: schemaError } })); return; }
     // dot path
-    const promptText = flattenInput(body.input);
+    const promptText = flattenInput(body.input, body.instructions);
     const cwd = extractCwd(body, promptText);
     const userTail = (() => { const i = promptText.lastIndexOf('\n\nUser:'); return (i >= 0 ? promptText.slice(i + 7) : promptText).trim(); })();
     const rec = logStart({ type: 'dot', model: body.model, status: 'running', prompt: userTail.slice(0, 2000), cwd: cwd || null, effort: body.reasoning?.effort || null });
     try {
       if (!promptText) throw new Error('empty input after flattening');
       log('dot turn start, prompt chars:', promptText.length, 'cwd:', cwd || '(default)');
-      const { text, tid } = await runDotTurn(promptText, cwd, body.reasoning?.effort || null);
+      const { text, tid } = await runDotTurn(promptText, cwd, body.reasoning?.effort || null, 280000, abortController.signal);
       rec.tid = tid;
       log('dot turn done, reply chars:', text.length);
       logEnd(rec, { status: 'ok', reply: text.slice(0, 4000) });
@@ -543,13 +529,20 @@ const server = http.createServer((req, res) => {
     } catch (e) {
       log('dot turn error:', e.message);
       logEnd(rec, { status: 'error', error: e.message });
-      const msg = '⚠ dot 調用失敗: ' + e.message;
-      try { sendDotResponse(req, res, body, msg); } catch {
-        if (!res.headersSent) res.writeHead(500, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify({ error: { message: e.message } }));
-      }
+      if (!res.destroyed) sendDotError(res, /timeout/i.test(e.message) ? 504 : 502, e.message, body);
     }
   });
 });
 
+let shuttingDown = false;
+function shutdown(signal) {
+  if (shuttingDown) return;
+  shuttingDown = true;
+  log('shutting down on', signal);
+  try { ws?.close(); } catch {}
+  server.close(() => process.exit(0));
+  setTimeout(() => process.exit(0), 2000).unref();
+}
+process.once('SIGINT', () => shutdown('SIGINT'));
+process.once('SIGTERM', () => shutdown('SIGTERM'));
 server.listen(PORT, BIND, () => log(`listening on http://${BIND}:${PORT}/v1  (dot slug: ${DOT_SLUG})`));

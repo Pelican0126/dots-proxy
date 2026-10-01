@@ -91,18 +91,21 @@ requires_openai_auth = true
 | `DOTS_UA` | 按平台生成 | 上游 WS 握手的 codex UA |
 | `CODEX_HOME` | `~/.codex` | codex 配置目錄 |
 | `DOTS_FALLBACK_MODEL` / `DOTS_FALLBACK_EFFORT` | `gpt-6.1-sol` / `low` | 切回官方直連時的模型回退 |
+| `DOTS_MANAGER_TOKEN` | 每次啟動隨機生成 | 管理面板 token；設置後可固定，請妥善保管 |
 
 ## 面板
 
-`http://127.0.0.1:8788/` — 調用記錄（模型/effort/耗時/狀態）、服務啟停、一鍵切回官方直連（自動備份 config，並恢復切換前的 `model_provider`）。
+啟動後終端會輸出帶一次性管理 token 的面板地址，例如 `http://127.0.0.1:8788/?token=...`。面板提供調用記錄（模型/effort/耗時/狀態）、服務啟停和一鍵切回官方直連；不要把帶 token 的地址分享給其他人。
 
 ## License
 
 [CC BY-NC 4.0](LICENSE) — 可自由使用、修改、分享，**禁止商用**；使用需署名。
 原作：[Pelican0126/dots-proxy](https://github.com/Pelican0126/dots-proxy)。
 
+這是 source-available 的非商用授權，不等同於 OSI 定義的「開源」；若要改成 MIT/Apache-2.0 等開源授權，需先確認原作程式碼的再授權權限。
+
 ## 安全說明
 
-- 所有數據只在本機；調用記錄存於 `dots-proxy-calls.jsonl`（已被 gitignore）
-- token 不離開本機，僅用於官方後端認證
+- 調用記錄存於 `dots-proxy-calls.jsonl`（已被 gitignore）；dot prompt、回覆和本機橋接產生的內容會按上游 OpenAI hosted thread 的服務流程處理，不代表數據只在本機
+- `auth.json` 的 token 僅用於官方後端認證，不要把它提交到倉庫或分享給其他人
 - 回滾：面板點「切回官方直連」，或用 `~/.codex/config.toml.bak-*` 備份覆蓋

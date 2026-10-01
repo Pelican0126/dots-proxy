@@ -4,7 +4,8 @@
 // Zero deps. Node >= 22.
 import http from 'node:http';
 import { spawn } from 'node:child_process';
-import { readFileSync, writeFileSync } from 'node:fs';
+import crypto from 'node:crypto';
+import { copyFileSync, existsSync, readFileSync, renameSync, unlinkSync, writeFileSync } from 'node:fs';
 import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { homedir } from 'node:os';
@@ -16,6 +17,8 @@ const CHILD_SCRIPT = join(SCRIPT_DIR, 'dots-proxy.mjs');
 const LOG_FILE = join(SCRIPT_DIR, 'dots-proxy-calls.jsonl');
 const CONFIG_PATH = join(process.env.CODEX_HOME || join(homedir(), '.codex'), 'config.toml');
 const STATE_FILE = join(SCRIPT_DIR, 'dots-manager-state.json');
+const MANAGER_TOKEN = process.env.DOTS_MANAGER_TOKEN || crypto.randomBytes(24).toString('hex');
+const CONFIG_EOF = '\n';
 
 const DOTS_CATALOG = (() => {
   const local = join(SCRIPT_DIR, 'dots-model-catalog.local.json');
@@ -36,13 +39,92 @@ const DOTS_PROVIDER_TABLE = [
 const FALLBACK_MODEL = process.env.DOTS_FALLBACK_MODEL || 'gpt-6.1-sol';
 const FALLBACK_EFFORT = process.env.DOTS_FALLBACK_EFFORT || 'low';
 
+function topLevelLines(cfg) {
+  const lines = cfg.split(/\r?\n/);
+  let multiline = null;
+  let end = lines.length;
+  const topLevel = new Set();
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i];
+    if (multiline) {
+      if (line.includes(multiline)) multiline = null;
+      continue;
+    }
+    if (/^\s*\[[^\[]/.test(line)) { end = i; break; }
+    topLevel.add(i);
+    const triple = line.includes('"""') ? '"""' : line.includes("'''") ? "'''" : null;
+    if (triple && line.indexOf(triple) === line.lastIndexOf(triple)) { multiline = triple; continue; }
+  }
+  return { lines, end, topLevel };
+}
+function topLevelScalar(cfg, key) {
+  const { lines, topLevel } = topLevelLines(cfg);
+  const re = new RegExp(`^\\s*${key.replace(/[.*+?^${}()|[\\]\\\\]/g, '\\$&')}\\s*=\\s*(?:"([^"]*)"|'([^']*)')\\s*(?:#.*)?$`);
+  for (const i of topLevel) {
+    const m = lines[i].match(re);
+    if (m) return m[1] ?? m[2];
+  }
+  return null;
+}
+function topLevelAssignment(cfg, key) {
+  const { lines, topLevel } = topLevelLines(cfg);
+  const escaped = key.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  const re = new RegExp(`^\\s*${escaped}\\s*=\\s*(?:"[^"]*"|'[^']*')\\s*(?:#.*)?$`);
+  return [...topLevel].map((i) => lines[i]).find((line) => re.test(line)) || null;
+}
+function replaceTopLevelScalar(cfg, key, value) {
+  const { lines, topLevel } = topLevelLines(cfg);
+  const escaped = key.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  const re = new RegExp(`^(\\s*${escaped}\\s*=\\s*)(?:"[^"]*"|'[^']*')`);
+  for (const i of topLevel) {
+    if (re.test(lines[i])) { lines[i] = lines[i].replace(re, `$1"${value}"`); break; }
+  }
+  return lines.join(CONFIG_EOF);
+}
+function removeTopLevelScalars(cfg, keys) {
+  const { lines, topLevel } = topLevelLines(cfg);
+  const wanted = new Set(keys);
+  const re = /^\s*([A-Za-z0-9_-]+)\s*=/;
+  return lines.filter((line, i) => !(topLevel.has(i) && wanted.has(line.match(re)?.[1]))).join(CONFIG_EOF);
+}
+function insertScalars(cfg, scalars) {
+  const { lines, end } = topLevelLines(cfg);
+  let pos = end;
+  if (pos > 0 && lines[pos - 1] === '') pos -= 1;
+  lines.splice(pos, 0, ...scalars, '');
+  return lines.join(CONFIG_EOF);
+}
 function currentMode() {
-  try { return readFileSync(CONFIG_PATH, 'utf8').includes('model_provider = "dots"') ? 'dots' : 'direct'; }
+  try { return topLevelScalar(readFileSync(CONFIG_PATH, 'utf8'), 'model_provider') === 'dots' ? 'dots' : 'direct'; }
   catch { return 'unknown'; }
+}
+function writeAtomic(path, data) {
+  const tmp = `${path}.tmp-${process.pid}-${Date.now()}`;
+  try {
+    writeFileSync(tmp, data, { mode: 0o600 });
+    try { renameSync(tmp, path); }
+    catch (e) {
+      if (!['EEXIST', 'EPERM'].includes(e.code)) throw e;
+      const old = `${path}.old-${process.pid}-${Date.now()}`;
+      let moved = false;
+      try {
+        renameSync(path, old);
+        moved = true;
+        renameSync(tmp, path);
+        try { unlinkSync(old); } catch {}
+      } catch (replaceError) {
+        if (moved) { try { renameSync(old, path); } catch {} }
+        throw replaceError;
+      }
+    }
+  } finally {
+    try { if (existsSync(tmp)) unlinkSync(tmp); } catch {}
+  }
 }
 function backupConfig(tag) {
   const p = CONFIG_PATH + '.bak-' + tag;
-  try { writeFileSync(p, readFileSync(CONFIG_PATH, 'utf8')); } catch {}
+  if (!existsSync(CONFIG_PATH)) throw new Error(`config not found: ${CONFIG_PATH}`);
+  copyFileSync(CONFIG_PATH, p);
   return p;
 }
 function readState() {
@@ -51,20 +133,7 @@ function readState() {
 function writeState(patch) {
   const st = { ...readState(), ...patch };
   for (const k of Object.keys(st)) if (st[k] == null) delete st[k];
-  try { writeFileSync(STATE_FILE, JSON.stringify(st)); } catch {}
-}
-// insert scalar lines into the top-level (before the first [table]) section
-function insertScalars(cfg, scalars) {
-  const lines = cfg.split('\n');
-  const at = lines.findIndex((l) => /^\s*\[/.test(l));
-  let pos = at < 0 ? lines.length : at;
-  if (pos > 0 && lines[pos - 1] === '') {
-    // a blank line already separates content from the table; insert before it
-    lines.splice(pos - 1, 0, ...scalars);
-  } else {
-    lines.splice(pos, 0, ...scalars, '');
-  }
-  return lines.join('\n');
+  writeAtomic(STATE_FILE, JSON.stringify(st));
 }
 function removeDotsTables(cfg) {
   const lines = cfg.split('\n');
@@ -76,80 +145,160 @@ function removeDotsTables(cfg) {
   }
   return lines.join('\n');
 }
+function dotsTable(cfg) {
+  const lines = cfg.split('\n');
+  const start = lines.findIndex((l) => l.trim() === '[model_providers.dots]');
+  if (start < 0) return null;
+  let end = lines.length;
+  for (let i = start + 1; i < lines.length; i++) {
+    if (/^\s*\[/.test(lines[i])) { end = i; break; }
+  }
+  return lines.slice(start, end).join('\n').replace(/\s+$/, '');
+}
 function setMode(mode) {
   let cfg = readFileSync(CONFIG_PATH, 'utf8');
-  backupConfig('mode-' + Date.now());
+  const backupPath = backupConfig('mode-' + Date.now());
   if (mode === 'direct') {
-    // remember the provider dots replaced, then remove all dots lines
-    cfg = cfg.split('\n').filter((l) =>
-      !l.startsWith('# dots:') && l.trim() !== 'model_provider = "dots"' && !l.trim().startsWith('model_catalog_json =')
-    ).join('\n');
-    cfg = removeDotsTables(cfg);
+    const st = readState();
+    const wasDots = currentMode() === 'dots';
+    const managedCatalog = st.managedCatalog || DOTS_CATALOG.replace(/\\/g, '/');
+    const { lines, topLevel } = topLevelLines(cfg);
+    const kept = lines.filter((line, i) => {
+      if (!topLevel.has(i)) return true;
+      if (line.trim() === '# dots: 本地代理入口（picker 裡的 gpt-dot 走 dot 雲端,其餘模型透傳官方後端）') return false;
+      const m = line.match(/^\s*([A-Za-z0-9_-]+)\s*=\s*(?:"([^"]*)"|'([^']*)')/);
+      if (!m) return true;
+      const value = m[2] ?? m[3];
+      if (m[1] === 'model_provider' && value === 'dots') return false;
+      if (m[1] === 'model_catalog_json' && value.replace(/\\/g, '/') === managedCatalog) return false;
+      return true;
+    });
+    cfg = kept.join(CONFIG_EOF);
+    if (wasDots || st.managedCatalog) cfg = removeDotsTables(cfg);
     // collapse the blank-line runs left behind by the removed dots block
     cfg = cfg.replace(/\n{3,}/g, '\n\n');
-    // restore the provider that was active before dots took over
-    const st = readState();
-    if (st.savedProvider && st.savedProvider !== 'dots' && !/^model_provider = "/m.test(cfg)) {
-      cfg = insertScalars(cfg, [`model_provider = "${st.savedProvider}"`]);
+    // restore the provider and catalog that were active before dots took over
+    if (st.savedProvider && topLevelScalar(cfg, 'model_provider') === null) {
+      cfg = insertScalars(cfg, [st.savedProviderLine || `model_provider = "${st.savedProvider}"`]);
     }
-    writeState({ savedProvider: null });
+    if (st.savedCatalog && topLevelScalar(cfg, 'model_catalog_json') === null) {
+      cfg = insertScalars(cfg, [st.savedCatalogLine || `model_catalog_json = "${st.savedCatalog.replace(/\\/g, '/') }"`]);
+    }
+    if (st.savedDotsTable && !dotsTable(cfg)) cfg = cfg.replace(/\s*$/, '\n\n') + st.savedDotsTable + '\n';
     // if active model is the dot pseudo-model, save it and fall back to a real one
-    const m = cfg.match(/^model = "([^"]+)"/m);
-    const e = cfg.match(/^model_reasoning_effort = "([^"]+)"/m);
-    if (m && /-dot$/.test(m[1])) {
-      writeState({ savedModel: m[1], savedEffort: e ? e[1] : null });
-      cfg = cfg.replace(/^model = "[^"]+"/m, `model = "${FALLBACK_MODEL}"`);
-      if (e) cfg = cfg.replace(/^model_reasoning_effort = "[^"]+"/m, `model_reasoning_effort = "${FALLBACK_EFFORT}"`);
+    const m = topLevelScalar(cfg, 'model');
+    const e = topLevelScalar(cfg, 'model_reasoning_effort');
+    if (m && /-dot$/.test(m)) {
+      writeState({ savedModel: m, savedEffort: e, fallbackModel: FALLBACK_MODEL, fallbackEffort: FALLBACK_EFFORT });
+      cfg = replaceTopLevelScalar(cfg, 'model', FALLBACK_MODEL);
+      if (e) cfg = replaceTopLevelScalar(cfg, 'model_reasoning_effort', FALLBACK_EFFORT);
     }
-    writeFileSync(CONFIG_PATH, cfg);
+    try {
+      writeAtomic(CONFIG_PATH, cfg);
+      writeState({ savedProvider: null, savedProviderLine: null, savedCatalog: null, savedCatalogLine: null, savedDotsTable: null, managedCatalog: null });
+    } catch (error) {
+      try { copyFileSync(backupPath, CONFIG_PATH); } catch {}
+      throw error;
+    }
     stopChild();
     return { ok: true, mode: 'direct' };
   }
   // mode === 'dots'
   if (currentMode() === 'dots') { startChild(); return { ok: true, mode: 'dots', already: true }; }
-  // remember the current provider so "切回官方直連" can restore it verbatim
-  const cur = cfg.match(/^model_provider = "([^"]+)"/m);
-  if (cur && cur[1] !== 'dots') writeState({ savedProvider: cur[1] });
-  // drop existing provider/catalog scalars to avoid duplicate TOML keys, then add ours
-  cfg = cfg.split('\n').filter((l) =>
-    !l.trim().startsWith('model_provider =') && !l.trim().startsWith('model_catalog_json =')
-  ).join('\n');
-  cfg = insertScalars(cfg, DOTS_SCALARS).replace(/\s*$/, '\n\n') + DOTS_PROVIDER_TABLE + '\n';
+  // remember only top-level values so profile-specific settings survive unchanged
+  const curProvider = topLevelScalar(cfg, 'model_provider');
+  const curCatalog = topLevelScalar(cfg, 'model_catalog_json');
+  const oldDotsTable = dotsTable(cfg);
+  if (curProvider && curProvider !== 'dots') writeState({ savedProvider: curProvider, savedProviderLine: topLevelAssignment(cfg, 'model_provider') });
+  if (curCatalog && curCatalog !== DOTS_CATALOG.replace(/\\/g, '/')) writeState({ savedCatalog: curCatalog, savedCatalogLine: topLevelAssignment(cfg, 'model_catalog_json') });
+  if (oldDotsTable && curProvider !== 'dots') writeState({ savedDotsTable: oldDotsTable });
+  cfg = removeTopLevelScalars(cfg, ['model_provider', 'model_catalog_json']);
+  cfg = removeDotsTables(cfg);
+  // Separate the new table even when the original file has no final newline.
+  cfg = insertScalars(cfg, DOTS_SCALARS) + '\n\n' + DOTS_PROVIDER_TABLE + '\n';
   // restore the model the user had before rollback, if saved
   const st = readState();
-  if (st.savedModel && /^model = "/m.test(cfg)) {
-    cfg = cfg.replace(/^model = "[^"]+"/m, `model = "${st.savedModel}"`);
-    if (st.savedEffort && /^model_reasoning_effort = "/m.test(cfg)) {
-      cfg = cfg.replace(/^model_reasoning_effort = "[^"]+"/m, `model_reasoning_effort = "${st.savedEffort}"`);
+  const currentModel = topLevelScalar(cfg, 'model');
+  const currentEffort = topLevelScalar(cfg, 'model_reasoning_effort');
+  if (st.savedModel && currentModel === (st.fallbackModel || FALLBACK_MODEL)) {
+    cfg = replaceTopLevelScalar(cfg, 'model', st.savedModel);
+    if (st.savedEffort && currentEffort === (st.fallbackEffort || FALLBACK_EFFORT)) {
+      cfg = replaceTopLevelScalar(cfg, 'model_reasoning_effort', st.savedEffort);
     }
+    writeState({ savedModel: null, savedEffort: null, fallbackModel: null, fallbackEffort: null });
   }
-  writeFileSync(CONFIG_PATH, cfg);
+  writeState({ managedCatalog: DOTS_CATALOG.replace(/\\/g, '/') });
+  writeAtomic(CONFIG_PATH, cfg);
   startChild();
   return { ok: true, mode: 'dots' };
 }
 
 function log(...a) { console.error('[dots-manager]', ...a); }
 
+function requestToken(req) {
+  const auth = String(req.headers.authorization || '');
+  if (auth === `Bearer ${MANAGER_TOKEN}`) return true;
+  const url = new URL(req.url || '/', 'http://127.0.0.1');
+  return url.searchParams.get('token') === MANAGER_TOKEN;
+}
+function requireManagerAuth(req, res) {
+  if (requestToken(req)) return true;
+  res.writeHead(401, { 'Content-Type': 'application/json', 'Cache-Control': 'no-store' });
+  res.end(JSON.stringify({ error: { message: 'manager authentication required' } }));
+  return false;
+}
+
 // ---------- child lifecycle ----------
 let child = null;
 let childStartedAt = null;
-function childRunning() { return child !== null && child.exitCode === null && !child.killed; }
+let childStopping = false;
+let childStartPending = false;
+function childRunning() { return child !== null && child.exitCode === null && !child.killed && !childStopping; }
 function startChild() {
+  if (child && child.exitCode === null && childStopping) { childStartPending = true; return { ok: false, stopping: true }; }
   if (childRunning()) return { ok: true, already: true };
   child = spawn(process.execPath, [CHILD_SCRIPT], {
     env: { ...process.env, DOTS_PROXY_PORT: String(CHILD_PORT) },
     stdio: ['ignore', 'inherit', 'inherit'],
   });
   childStartedAt = Date.now();
-  child.on('exit', (code) => { log('child exited, code', code); });
+  childStopping = false;
+  const startedChild = child;
+  child.on('exit', (code, signal) => {
+    log('child exited, code', code, 'signal', signal || '-');
+    if (child === startedChild) {
+      child = null;
+      childStopping = false;
+      if (childStartPending && !shuttingDown) { childStartPending = false; setImmediate(() => startChild()); }
+    }
+  });
   log('child started, pid', child.pid);
   return { ok: true, pid: child.pid };
 }
 function stopChild() {
+  childStartPending = false;
   if (!childRunning()) return { ok: true, already: true };
-  child.kill();
+  childStopping = true;
+  child.kill('SIGTERM');
   return { ok: true };
 }
+
+let shuttingDown = false;
+function shutdown(signal) {
+  if (shuttingDown) return;
+  shuttingDown = true;
+  childStartPending = false;
+  log('shutting down on', signal);
+  if (child && child.exitCode === null) child.kill('SIGTERM');
+  const force = setTimeout(() => {
+    try { if (child && child.exitCode === null) child.kill('SIGKILL'); } catch {}
+    process.exit(0);
+  }, 2000);
+  force.unref();
+  server.close(() => process.exit(0));
+}
+process.once('SIGINT', () => shutdown('SIGINT'));
+process.once('SIGTERM', () => shutdown('SIGTERM'));
 
 // ---------- logs (read from disk; fold _update lines) ----------
 function readLogs() {
@@ -167,8 +316,11 @@ function readLogs() {
     }
     out.push(r);
   }
-  if (!childRunning()) for (const r of out) if (r.status === 'running') r.status = 'interrupted';
-  else if (childStartedAt) for (const r of out) if (r.status === 'running' && r.ts < childStartedAt) r.status = 'interrupted';
+  if (!childRunning()) {
+    for (const r of out) if (r.status === 'running') r.status = 'interrupted';
+  } else if (childStartedAt) {
+    for (const r of out) if (r.status === 'running' && r.ts < childStartedAt) r.status = 'interrupted';
+  }
   return out.slice(-500).reverse();
 }
 
@@ -183,6 +335,9 @@ function forward(req, res) {
     res.writeHead(upRes.statusCode || 502, upRes.headers);
     upRes.pipe(res);
   });
+  up.setTimeout(300000, () => up.destroy(new Error('proxy child timeout')));
+  req.once('aborted', () => up.destroy(new Error('client disconnected')));
+  res.once('close', () => { if (!res.writableEnded) up.destroy(new Error('client disconnected')); });
   up.on('error', (e) => {
     if (!res.headersSent) res.writeHead(502, { 'Content-Type': 'application/json' });
     res.end(JSON.stringify({ error: { message: 'proxy child unreachable: ' + e.message } }));
@@ -231,7 +386,7 @@ const PAGE = `<!doctype html>
 </head>
 <body>
 <h1>dots-proxy 調用記錄</h1>
-<div class="sub">每 2 秒自動刷新 · 只存本機 · 最多保留 500 條</div>
+<div class="sub">每 2 秒自動刷新 · 調用記錄保存在本機 · 最多顯示 500 條</div>
 <div class="bar">
   <span class="pill off" id="pill">檢查中…</span>
   <button id="btnStart" onclick="ctl('start')">啟動</button>
@@ -244,6 +399,12 @@ const PAGE = `<!doctype html>
 <div class="stats" id="stats"></div>
 <div id="list"></div>
 <script>
+const CONTROL_TOKEN = new URLSearchParams(location.search).get('token') || '';
+async function api(path, options){
+  options=options||{};
+  options.headers=Object.assign({}, options.headers||{}, {Authorization:'Bearer '+CONTROL_TOKEN});
+  return fetch(path, options);
+}
 function esc(s){return String(s==null?'':s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');}
 function fmtTime(ts){var d=new Date(ts);return d.toLocaleTimeString('zh-TW',{hour12:false});}
 function fmtDur(ms){if(ms==null)return '-';return ms<1000?ms+'ms':(ms/1000).toFixed(1)+'s';}
@@ -252,23 +413,23 @@ function dispModel(m){return m==='gpt-6-astra-dot'?'gpt-dot':m;}
 async function ctl(action){
   document.getElementById('btnStart').disabled=true;
   document.getElementById('btnStop').disabled=true;
-  try{await fetch('/api/'+action,{method:'POST'});}catch(e){}
+  try{await api('/api/'+action,{method:'POST'});}catch(e){}
   setTimeout(refresh,action==='start'?1500:300);
 }
 async function switchMode(){
-  var st=await (await fetch('/api/status')).json();
+  var st=await (await api('/api/status')).json();
   var target=st.mode==='dots'?'direct':'dots';
   var msg=target==='direct'
     ?'切回官方直連：codex 將不再經過 dots 代理，所有模型恢復官方通道計費。\\n（會在 config 同目錄留備份；若當前模型是 gpt-dot 會自動切回 gpt-6.1-sol）\\n\\n確定？'
     :'恢復 dots 代理：codex 流量重新走 127.0.0.1:8788，gpt-dot 走 dot 雲端。\\n\\n確定？';
   if(!confirm(msg))return;
   document.getElementById('btnMode').disabled=true;
-  try{await fetch('/api/mode',{method:'POST',body:JSON.stringify({mode:target})});}catch(e){}
+  try{await api('/api/mode',{method:'POST',body:JSON.stringify({mode:target})});}catch(e){}
   setTimeout(refresh,800);
 }
 async function refresh(){
   try{
-    var st=await (await fetch('/api/status')).json();
+    var st=await (await api('/api/status')).json();
     var pill=document.getElementById('pill');
     pill.textContent=st.running?'服務運行中':'已停止';
     pill.className='pill '+(st.running?'on':'off');
@@ -283,7 +444,7 @@ async function refresh(){
     document.getElementById('uptime').textContent=st.running&&st.startedAt?('本次啟動 '+new Date(st.startedAt).toLocaleTimeString('zh-TW',{hour12:false})):'';
   }catch(e){}
   try{
-    var r=await fetch('/api/logs');var data=await r.json();
+    var r=await api('/api/logs');var data=await r.json();
     var logs=data.logs;
     var dot=logs.filter(function(l){return l.type==='dot';});
     var err=logs.filter(function(l){return l.status==='error';});
@@ -324,43 +485,55 @@ document.getElementById('list').addEventListener('click',function(e){
 const server = http.createServer(async (req, res) => {
   const path = req.url.replace(/\?.*$/, '');
   if (req.method === 'GET' && (path === '/' || path === '/console')) {
+    if (!requestToken(req)) {
+      res.writeHead(401, { 'Content-Type': 'text/plain; charset=utf-8', 'Cache-Control': 'no-store' });
+      res.end('Open the manager URL printed in the terminal, including its token.');
+      return;
+    }
     res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
     res.end(PAGE);
     return;
   }
   if (req.method === 'GET' && path === '/api/status') {
+    if (!requireManagerAuth(req, res)) return;
     res.writeHead(200, { 'Content-Type': 'application/json' });
     res.end(JSON.stringify({ running: childRunning(), pid: childRunning() ? child.pid : null, startedAt: childRunning() ? childStartedAt : null, mode: currentMode() }));
     return;
   }
   if (req.method === 'POST' && path === '/api/mode') {
+    if (!requireManagerAuth(req, res)) return;
     let raw = '';
-    req.on('data', (c) => raw += c);
+    let tooLarge = false;
+    req.on('data', (c) => { raw += c; if (raw.length > 64 * 1024) tooLarge = true; });
     req.on('end', () => {
       let mode = null;
       try { mode = JSON.parse(raw).mode; } catch {}
-      res.writeHead(200, { 'Content-Type': 'application/json' });
+      if (tooLarge) { res.writeHead(413, { 'Content-Type': 'application/json' }); res.end(JSON.stringify({ ok: false, error: 'request too large' })); return; }
       if (mode === 'dots' || mode === 'direct') {
-        try { res.end(JSON.stringify(setMode(mode))); }
-        catch (e) { res.end(JSON.stringify({ ok: false, error: e.message })); }
+        try { const result = setMode(mode); res.writeHead(200, { 'Content-Type': 'application/json' }); res.end(JSON.stringify(result)); }
+        catch (e) { res.writeHead(500, { 'Content-Type': 'application/json' }); res.end(JSON.stringify({ ok: false, error: e.message })); }
       } else {
+        res.writeHead(400, { 'Content-Type': 'application/json' });
         res.end(JSON.stringify({ ok: false, error: 'bad mode' }));
       }
     });
     return;
   }
   if (req.method === 'POST' && path === '/api/start') {
+    if (!requireManagerAuth(req, res)) return;
     res.writeHead(200, { 'Content-Type': 'application/json' });
     res.end(JSON.stringify(startChild()));
     return;
   }
   if (req.method === 'POST' && path === '/api/stop') {
+    if (!requireManagerAuth(req, res)) return;
     res.writeHead(200, { 'Content-Type': 'application/json' });
     res.end(JSON.stringify(stopChild()));
     return;
   }
   if (req.method === 'GET' && path === '/api/logs') {
-    res.writeHead(200, { 'Content-Type': 'application/json' });
+    if (!requireManagerAuth(req, res)) return;
+    res.writeHead(200, { 'Content-Type': 'application/json', 'Cache-Control': 'no-store' });
     res.end(JSON.stringify({ logs: readLogs() }));
     return;
   }
@@ -373,6 +546,6 @@ const server = http.createServer(async (req, res) => {
 });
 
 server.listen(PORT, '127.0.0.1', () => {
-  log(`console on http://127.0.0.1:${PORT}/  (proxy child port ${CHILD_PORT})`);
+  log(`console on http://127.0.0.1:${PORT}/?token=${MANAGER_TOKEN}  (proxy child port ${CHILD_PORT})`);
   startChild();
 });
