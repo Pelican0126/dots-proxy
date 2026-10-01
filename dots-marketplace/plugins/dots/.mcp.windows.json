@@ -1,14 +1,15 @@
 {
   "mcpServers": {
     "dots": {
-      "command": "sh",
+      "command": "cmd.exe",
       "args": [
-        "scripts/launch_dots_mcp.sh"
+        "/d",
+        "/c",
+        "scripts\\launch_dots_mcp.cmd"
       ],
       "cwd": ".",
       "env_vars": [
         "PATH",
-        "HOME",
         "USERPROFILE",
         "CODEX_HOME",
         "CODEX_MCP_NODE_PATH",

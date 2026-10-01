@@ -7,13 +7,14 @@ import { spawn } from 'node:child_process';
 import { readFileSync, writeFileSync } from 'node:fs';
 import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { homedir } from 'node:os';
 
 const SCRIPT_DIR = dirname(fileURLToPath(import.meta.url));
 const PORT = 8788;
 const CHILD_PORT = 8789;
 const CHILD_SCRIPT = join(SCRIPT_DIR, 'dots-proxy.mjs');
 const LOG_FILE = join(SCRIPT_DIR, 'dots-proxy-calls.jsonl');
-const CONFIG_PATH = join(process.env.USERPROFILE || '', '.codex', 'config.toml');
+const CONFIG_PATH = join(process.env.CODEX_HOME || join(homedir(), '.codex'), 'config.toml');
 const STATE_FILE = join(SCRIPT_DIR, 'dots-manager-state.json');
 
 const DOTS_CATALOG = (() => {
@@ -32,8 +33,8 @@ const DOTS_PROVIDER_TABLE = [
   'wire_api = "responses"',
   'requires_openai_auth = true',
 ].join('\n');
-const FALLBACK_MODEL = 'gpt-6.1-sol';
-const FALLBACK_EFFORT = 'low';
+const FALLBACK_MODEL = process.env.DOTS_FALLBACK_MODEL || 'gpt-6.1-sol';
+const FALLBACK_EFFORT = process.env.DOTS_FALLBACK_EFFORT || 'low';
 
 function currentMode() {
   try { return readFileSync(CONFIG_PATH, 'utf8').includes('model_provider = "dots"') ? 'dots' : 'direct'; }
@@ -44,28 +45,59 @@ function backupConfig(tag) {
   try { writeFileSync(p, readFileSync(CONFIG_PATH, 'utf8')); } catch {}
   return p;
 }
+function readState() {
+  try { return JSON.parse(readFileSync(STATE_FILE, 'utf8')); } catch { return {}; }
+}
+function writeState(patch) {
+  const st = { ...readState(), ...patch };
+  for (const k of Object.keys(st)) if (st[k] == null) delete st[k];
+  try { writeFileSync(STATE_FILE, JSON.stringify(st)); } catch {}
+}
+// insert scalar lines into the top-level (before the first [table]) section
+function insertScalars(cfg, scalars) {
+  const lines = cfg.split('\n');
+  const at = lines.findIndex((l) => /^\s*\[/.test(l));
+  let pos = at < 0 ? lines.length : at;
+  if (pos > 0 && lines[pos - 1] === '') {
+    // a blank line already separates content from the table; insert before it
+    lines.splice(pos - 1, 0, ...scalars);
+  } else {
+    lines.splice(pos, 0, ...scalars, '');
+  }
+  return lines.join('\n');
+}
+function removeDotsTables(cfg) {
+  const lines = cfg.split('\n');
+  const start = lines.findIndex((l) => l.trim() === '[model_providers.dots]');
+  if (start >= 0) {
+    let end = lines.length;
+    for (let i = start + 1; i < lines.length; i++) { if (/^\s*\[/.test(lines[i])) { end = i; break; } }
+    lines.splice(start, end - start);
+  }
+  return lines.join('\n');
+}
 function setMode(mode) {
   let cfg = readFileSync(CONFIG_PATH, 'utf8');
   backupConfig('mode-' + Date.now());
   if (mode === 'direct') {
-    // remove dots scalar lines (3 consecutive lines, comment may be the old 6-Astra-dot wording)
+    // remember the provider dots replaced, then remove all dots lines
     cfg = cfg.split('\n').filter((l) =>
       !l.startsWith('# dots:') && l.trim() !== 'model_provider = "dots"' && !l.trim().startsWith('model_catalog_json =')
     ).join('\n');
-    // remove [model_providers.dots] table
-    const lines = cfg.split('\n');
-    const start = lines.findIndex((l) => l.trim() === '[model_providers.dots]');
-    if (start >= 0) {
-      let end = lines.length;
-      for (let i = start + 1; i < lines.length; i++) { if (/^\s*\[/.test(lines[i])) { end = i; break; } }
-      lines.splice(start, end - start);
-      cfg = lines.join('\n');
+    cfg = removeDotsTables(cfg);
+    // collapse the blank-line runs left behind by the removed dots block
+    cfg = cfg.replace(/\n{3,}/g, '\n\n');
+    // restore the provider that was active before dots took over
+    const st = readState();
+    if (st.savedProvider && st.savedProvider !== 'dots' && !/^model_provider = "/m.test(cfg)) {
+      cfg = insertScalars(cfg, [`model_provider = "${st.savedProvider}"`]);
     }
+    writeState({ savedProvider: null });
     // if active model is the dot pseudo-model, save it and fall back to a real one
     const m = cfg.match(/^model = "([^"]+)"/m);
     const e = cfg.match(/^model_reasoning_effort = "([^"]+)"/m);
     if (m && /-dot$/.test(m[1])) {
-      writeFileSync(STATE_FILE, JSON.stringify({ savedModel: m[1], savedEffort: e ? e[1] : null }));
+      writeState({ savedModel: m[1], savedEffort: e ? e[1] : null });
       cfg = cfg.replace(/^model = "[^"]+"/m, `model = "${FALLBACK_MODEL}"`);
       if (e) cfg = cfg.replace(/^model_reasoning_effort = "[^"]+"/m, `model_reasoning_effort = "${FALLBACK_EFFORT}"`);
     }
@@ -75,20 +107,22 @@ function setMode(mode) {
   }
   // mode === 'dots'
   if (currentMode() === 'dots') { startChild(); return { ok: true, mode: 'dots', already: true }; }
-  const lines = cfg.split('\n');
-  const firstTable = lines.findIndex((l) => /^\s*\[/.test(l));
-  lines.splice(firstTable < 0 ? lines.length : firstTable, 0, ...DOTS_SCALARS, '');
-  cfg = lines.join('\n').replace(/\s*$/, '\n\n') + DOTS_PROVIDER_TABLE + '\n';
+  // remember the current provider so "切回官方直連" can restore it verbatim
+  const cur = cfg.match(/^model_provider = "([^"]+)"/m);
+  if (cur && cur[1] !== 'dots') writeState({ savedProvider: cur[1] });
+  // drop existing provider/catalog scalars to avoid duplicate TOML keys, then add ours
+  cfg = cfg.split('\n').filter((l) =>
+    !l.trim().startsWith('model_provider =') && !l.trim().startsWith('model_catalog_json =')
+  ).join('\n');
+  cfg = insertScalars(cfg, DOTS_SCALARS).replace(/\s*$/, '\n\n') + DOTS_PROVIDER_TABLE + '\n';
   // restore the model the user had before rollback, if saved
-  try {
-    const st = JSON.parse(readFileSync(STATE_FILE, 'utf8'));
-    if (st.savedModel && /^model = "/m.test(cfg)) {
-      cfg = cfg.replace(/^model = "[^"]+"/m, `model = "${st.savedModel}"`);
-      if (st.savedEffort && /^model_reasoning_effort = "/m.test(cfg)) {
-        cfg = cfg.replace(/^model_reasoning_effort = "[^"]+"/m, `model_reasoning_effort = "${st.savedEffort}"`);
-      }
+  const st = readState();
+  if (st.savedModel && /^model = "/m.test(cfg)) {
+    cfg = cfg.replace(/^model = "[^"]+"/m, `model = "${st.savedModel}"`);
+    if (st.savedEffort && /^model_reasoning_effort = "/m.test(cfg)) {
+      cfg = cfg.replace(/^model_reasoning_effort = "[^"]+"/m, `model_reasoning_effort = "${st.savedEffort}"`);
     }
-  } catch {}
+  }
   writeFileSync(CONFIG_PATH, cfg);
   startChild();
   return { ok: true, mode: 'dots' };

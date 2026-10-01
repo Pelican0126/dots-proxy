@@ -5,8 +5,9 @@ import tls from 'node:tls';
 import crypto from 'node:crypto';
 import { readFileSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
+import { homedir } from 'node:os';
 
-const CODEX_HOME = process.env.CODEX_HOME || join(process.env.USERPROFILE || '', '.codex');
+const CODEX_HOME = process.env.CODEX_HOME || join(homedir(), '.codex');
 const AUTH_PATH = join(CODEX_HOME, 'auth.json');
 const UPSTREAM_HOST = 'codex-cloud-backend.chatgpt.com';
 const CLIENT_ID = 'app_EMoamEEZ73f0CkXaXp7hrann';
@@ -78,7 +79,7 @@ class Ws {
           `GET / HTTP/1.1\r\nHost: ${this.host}\r\n` +
           `Authorization: Bearer ${this.token}\r\n` +
           `chatgpt-account-id: ${this.accountId}\r\n` +
-          `User-Agent: codex/0.145.0 (Windows 10.0; x86_64)\r\n` +
+          `User-Agent: codex/0.159.2 (${process.platform === 'darwin' ? 'Mac OS 26.0.0' : process.platform === 'win32' ? 'Windows 10.0' : 'Linux'}; ${process.arch === 'arm64' ? 'arm64' : 'x86_64'})\r\n` +
           `originator: codex_cli_rs\r\n` +
           `Connection: Upgrade\r\nUpgrade: websocket\r\n` +
           `Sec-WebSocket-Version: 13\r\nSec-WebSocket-Key: ${key}\r\n\r\n`);

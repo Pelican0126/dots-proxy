@@ -10,6 +10,8 @@ import zlib from 'node:zlib';
 import { readFileSync, writeFileSync, appendFileSync } from 'node:fs';
 import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { homedir } from 'node:os';
+import { execSync } from 'node:child_process';
 
 const SCRIPT_DIR = dirname(fileURLToPath(import.meta.url));
 
@@ -18,9 +20,14 @@ const BIND = '127.0.0.1';
 const DOT_SLUG = process.env.DOTS_PROXY_MODEL || 'gpt-6-astra-dot';
 const UPSTREAM_HOST = 'codex-cloud-backend.chatgpt.com';
 const PASSTHROUGH = { host: 'chatgpt.com', path: '/backend-api/codex/responses' };
-const CODEX_HOME = process.env.CODEX_HOME || join(process.env.USERPROFILE || '', '.codex');
+const CODEX_HOME = process.env.CODEX_HOME || join(homedir(), '.codex');
 const AUTH_PATH = join(CODEX_HOME, 'auth.json');
 const CLIENT_ID = 'app_EMoamEEZ73f0CkXaXp7hrann';
+
+// Codex-style UA for the upstream WS handshake. Version/platform are cosmetic but
+// should look like a real client; override with DOTS_UA if Cloudflare gets picky.
+const CODEX_UA = process.env.DOTS_UA ||
+  `codex/0.159.2 (${process.platform === 'darwin' ? 'Mac OS 26.0.0' : process.platform === 'win32' ? 'Windows 10.0' : 'Linux'}; ${process.arch === 'arm64' ? 'arm64' : 'x86_64'})`;
 
 function log(...a) { console.error('[dots-proxy]', ...a); }
 
@@ -76,7 +83,7 @@ class Ws {
           `GET / HTTP/1.1\r\nHost: ${this.host}\r\n` +
           `Authorization: Bearer ${this.token}\r\n` +
           `chatgpt-account-id: ${this.accountId}\r\n` +
-          `User-Agent: codex/0.145.0 (Windows 10.0; x86_64)\r\n` +
+          `User-Agent: ${CODEX_UA}\r\n` +
           `originator: codex_cli_rs\r\n` +
           `Connection: Upgrade\r\nUpgrade: websocket\r\n` +
           `Sec-WebSocket-Version: 13\r\nSec-WebSocket-Key: ${key}\r\n\r\n`);
@@ -234,13 +241,50 @@ function flattenInput(input) {
 }
 
 // ---------- dot turn ----------
-const LOCAL_ENV = process.env.DOTS_ENV_ID || '';
 const DEFAULT_WORKSPACE = process.env.DOTS_WORKSPACE || process.cwd();
+
+// DOTS_ENV_ID: explicit id, empty (cloud-only), or "auto" to discover the
+// environment-id of the codex exec-server bridge process the desktop app runs.
+function discoverEnvId() {
+  if (process.platform === 'win32') {
+    try {
+      const out = execSync('wmic process where "name like \'codex%\'" get CommandLine /format:list', { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] });
+      const m = out.match(/exec-server\s+.*?--environment-id\s+(\S+)/i);
+      return m ? m[1] : '';
+    } catch { return ''; }
+  }
+  try {
+    const out = execSync('ps axo command', { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] });
+    for (const line of out.split('\n')) {
+      if (!line.includes('exec-server') || line.includes('grep')) continue;
+      const m = line.match(/--environment-id[=\s]+(\S+)/);
+      if (m) return m[1];
+    }
+  } catch {}
+  return '';
+}
+const LOCAL_ENV = (() => {
+  const v = process.env.DOTS_ENV_ID || '';
+  if (v && v !== 'auto') return v;
+  if (v === 'auto') {
+    const id = discoverEnvId();
+    if (id) { log('auto-discovered bridge environment:', id); return id; }
+    log('DOTS_ENV_ID=auto but no exec-server bridge found; running cloud-only');
+  }
+  return '';
+})();
 
 function extractCwd(body, flatText) {
   const text = (typeof body.instructions === 'string' ? body.instructions : '') + '\n' + flatText;
-  const m = text.match(/working directory[:\s]+([A-Za-z]:[\/\\][^\n`"<>|]*)/i);
+  // <cwd>/path</cwd> (newer codex environment_context blocks)
+  let m = text.match(/<cwd>\s*([^\s<][^<]*?)\s*<\/cwd>/i);
   if (m) return m[1].trim().replace(/\\/g, '/').replace(/\/+$/, '');
+  // Windows drive path: C:\... or C:/...
+  m = text.match(/working directory[:\s]+([A-Za-z]:[\/\\][^\n`"<>|]*)/i);
+  if (m) return m[1].trim().replace(/\\/g, '/').replace(/\/+$/, '');
+  // POSIX absolute path: /Users/... etc. Stop at whitespace/backtick/quote.
+  m = text.match(/working directory[:\s]+(\/[^\n`"<>|]*)/i);
+  if (m) return m[1].trim().replace(/\/+$/, '');
   return null;
 }
 

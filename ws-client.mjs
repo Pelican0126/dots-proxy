@@ -5,7 +5,11 @@ import tls from 'node:tls';
 import crypto from 'node:crypto';
 
 export class CodexWsClient {
-  constructor({ host, path = '/', token, accountId, userAgent = 'codex/0.145.0 (Windows 10.0; x86_64)', originator = 'codex_cli_rs' }) {
+  constructor({ host, path = '/', token, accountId, userAgent, originator = 'codex_cli_rs' }) {
+    if (!userAgent) {
+      const os = process.platform === 'darwin' ? 'Mac OS 26.0.0' : process.platform === 'win32' ? 'Windows 10.0' : 'Linux';
+      userAgent = `codex/0.159.2 (${os}; ${process.arch === 'arm64' ? 'arm64' : 'x86_64'})`;
+    }
     this.host = host;
     this.path = path;
     this.token = token;
